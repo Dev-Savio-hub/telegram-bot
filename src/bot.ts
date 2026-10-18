@@ -42,6 +42,15 @@ import {
   PAUSE_MESSAGES,
   RESUME_MESSAGES,
 } from "./i18n.js";
+import { canControl } from "./commands/admin-check.js";
+export {
+  AdminCache,
+  canControl,
+  clearAdminCache,
+  DEFAULT_ADMIN_CACHE_MAX_SIZE,
+  DEFAULT_ADMIN_CACHE_TTL_MS,
+  isChatAdmin,
+} from "./commands/admin-check.js";
 
 /** Shared metadata for handlers, help, and Telegram's command menu. */
 const COMMANDS = [
@@ -627,7 +636,7 @@ export function registerCommandHandlers(
     },
 
     audit: async (ctx) => {
-      if (!isOperator(ctx, config)) {
+      if (!(await canControl(ctx, config, ctx.api))) {
         // Same authorization model as /pause and /resume: the report is only
         // meant for the operator, so other users get silence, not an error that
         // would confirm the command exists. The standalone `npm run audit` CLI
@@ -680,7 +689,7 @@ export function registerCommandHandlers(
     },
 
     pause: async (ctx) => {
-      if (!isOperator(ctx, config)) {
+      if (!(await canControl(ctx, config, ctx.api))) {
         console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
         return;
       }
@@ -688,7 +697,7 @@ export function registerCommandHandlers(
     },
 
     resume: async (ctx) => {
-      if (!isOperator(ctx, config)) {
+      if (!(await canControl(ctx, config, ctx.api))) {
         console.warn(`[bot] ignored unauthorized /resume on update ${ctx.update.update_id}`);
         return;
       }
@@ -782,7 +791,7 @@ export async function handleCallbackQuery(
 
   // Enforce operator role authorization
   if (action.type === "pause" || action.type === "resume") {
-    if (!isOperator(ctx, config)) {
+    if (!(await canControl(ctx, config, ctx.api))) {
       console.warn(
         `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
       );
@@ -893,7 +902,7 @@ export function createBot(deps: BotDeps): Bot {
 
   bot.command("export", async (ctx) => {
     // Same authorization model as /audit: recent logs are for the operator.
-    if (!isOperator(ctx, config)) {
+    if (!(await canControl(ctx, config, ctx.api))) {
       console.warn(`[bot] ignored unauthorized /export on update ${ctx.update.update_id}`);
       return;
     }
