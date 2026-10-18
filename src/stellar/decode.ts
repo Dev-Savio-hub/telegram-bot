@@ -1332,28 +1332,49 @@ export function dedupeEvents<T extends EventMeta>(events: readonly T[]): T[] {
 const MAX_LOG_FIELD_CHARS = 240;
 const MAX_LOG_JSON_CHARS = 4_096;
 
+const ANSI_ESCAPE_PATTERN =
+  /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]/g;
+const CONTROL_OR_WHITESPACE_PATTERN = /[\x00-\x1f\x7f-\x9f\s]+/g;
+
+function cleanLogString(value: string): string {
+  const compact = value
+    .replace(ANSI_ESCAPE_PATTERN, "")
+    .replace(CONTROL_OR_WHITESPACE_PATTERN, " ")
+    .trim();
+  return compact.length <= MAX_LOG_FIELD_CHARS
+    ? compact
+    : `${compact.slice(0, MAX_LOG_FIELD_CHARS - 1)}…`;
+}
+
 /**
  * JSON-safe view of a payload for logs and the `scan` CLI.
  *
- * Bounded twice, because the failure modes differ: every string is collapsed to
- * a single line and capped, so one remote value cannot dominate a log line, and
- * the serialized document is capped as a whole, so a payload built from many
- * fields cannot either. `bigint` is stringified explicitly because
- * `JSON.stringify` throws on it.
+ * Bounded twice, because the failure modes differ: every string is stripped of
+ * ANSI/control sequences, collapsed to a single line and capped, so one remote
+ * value cannot dominate or corrupt a log line, and the serialized document is
+ * capped as a whole, so a payload built from many fields cannot either. Plain
+ * object keys are sorted for deterministic log output, and `bigint` is
+ * stringified and bounded explicitly because `JSON.stringify` throws on it.
  */
 export function summarizePayloadForLog(
   payload: unknown,
   maxChars = MAX_LOG_JSON_CHARS,
 ): string {
-  const json = JSON.stringify(payload, (_key, item) => {
-    if (typeof item === "bigint") return item.toString();
-    if (typeof item !== "string") return item;
-    const compact = item.replace(/\s+/g, " ").trim();
-    return compact.length <= MAX_LOG_FIELD_CHARS
-      ? compact
-      : `${compact.slice(0, MAX_LOG_FIELD_CHARS - 1)}…`;
-  });
-  return json.length <= maxChars ? json : `${json.slice(0, maxChars - 1)}…`;
+  const limit = Math.max(1, maxChars);
+  const json =
+    JSON.stringify(payload, (_key, item) => {
+      if (typeof item === "bigint") return cleanLogString(item.toString());
+      if (typeof item === "string") return cleanLogString(item);
+      if (isRecord(item)) {
+        const sorted: Record<string, unknown> = {};
+        for (const k of Object.keys(item).sort()) {
+          sorted[cleanLogString(k)] = item[k];
+        }
+        return sorted;
+      }
+      return item;
+    }) ?? "null";
+  return json.length <= limit ? json : `${json.slice(0, limit - 1)}…`;
 }
 
 /**
