@@ -22,18 +22,26 @@ import {
   shortAddress,
   squadSideLabel,
   winnerSideLabel,
+  type ContractSource,
   type DecodedEvent,
 } from "../stellar/decode.js";
 import { normalizeCategory } from "../stellar/category.js";
 import { appUrlFor } from "./app-links.js";
+import { escapeMdLinkUrl, safeLinkUrl } from "./link-safety.js";
 import { iconForCategory } from "./category-icons.js";
-import { groupDigestEvents } from "./digest-grouping.js";
+import { groupDigestEvents, sortDigestEvents } from "./digest-grouping.js";
 import { confidenceIndicator } from "./confidence.js";
 import { sanitizeUserText } from "./sanitize.js";
 import { settlementLines } from "./settlement.js";
 import { formatSquadResolution, renderSquadResolution } from "./squad-resolution.js";
-import type { StellarConfig } from "../config.js";
-import { messagesFor, type Messages } from "../i18n.js";
+import type { StellarConfig, TelegramRoute } from "../config.js";
+import {
+  DEFAULT_LOCALE,
+  messagesFor,
+  normalizeLocale,
+  type Locale,
+  type Messages,
+} from "../i18n.js";
 import { formatDeadline } from "./time.js";
 import {
   highlightLevel,
@@ -51,6 +59,27 @@ export {
 
 /** Telegram's MarkdownV2 reserved set. All of it must be escaped, everywhere. */
 const MDV2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
+/**
+ * Unicode First-Strong-Isolate / Pop-Directional-Isolate.
+ *
+ * Wrapping an already-formatted amount in FSI…PDI keeps the digits
+ * and the "USDC" unit readable left-to-right regardless of the
+ * surrounding text direction, while leaving the string's bytes intact
+ * (the isolate is a Unicode control, not a markup change).
+ */
+const FSI = "\u2068";
+const PDI = "\u2069";
+
+/**
+ * Isolate a displayed amount from the surrounding text direction (#920).
+ *
+ * The exact numeric text is preserved; only the two invisible control
+ * characters FSI/PDI surround it. Use this on every user-visible amount.
+ */
+export function isolateAmount(text: string): string {
+  return `${FSI}${text}${PDI}`;
+}
+
 const MAX_EVENT_FIELD_LENGTH = 200;
 const MAX_TX_HASH_LENGTH = 128;
 
@@ -61,6 +90,44 @@ export function escapeMd(text: string): string {
 
 /** Telegram Bot API hard limit for sendMessage / editMessageText text. */
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+/**
+ * UTF-16 code-unit length of `text`.
+ *
+ * Telegram measures its 4096-character limit in UTF-16 code units, after
+ * entity / markup handling. JavaScript's `string.length` is exactly that
+ * unit — one code unit per `charCodeAt` index — so this helper exists to
+ * make the unit explicit at every call site and keep one definition.
+ *
+ * Do NOT replace this with `Array.from(s).length`: that counts Unicode code
+ * points, which is a different (smaller) number for any string containing an
+ * astral character (every emoji, most CJK extensions). A message that fits
+ * under a code-point budget can still exceed Telegram's UTF-16 limit.
+ */
+export function utf16Length(text: string): number {
+  return text.length;
+}
+
+/**
+ * Clip `text` to at most `max` UTF-16 code units without splitting a
+ * surrogate pair. The returned string is <= `max` UTF-16 units (the ellipsis
+ * is one unit). Returns `text` unchanged when it already fits.
+ */
+export function clipUtf16(text: string, max: number): string {
+  if (!Number.isFinite(max) || max < 1) return "";
+  if (utf16Length(text) <= max) return text;
+  // Reserve one unit for the trailing ellipsis.
+  const budget = max - 1;
+  let used = 0;
+  const out: string[] = [];
+  for (const cp of Array.from(text)) {
+    const w = cp.length; // 1 for BMP, 2 for astral code points
+    if (used + w > budget) break;
+    out.push(cp);
+    used += w;
+  }
+  return `${out.join("")}…`;
+}
 
 /**
  * Split a MarkdownV2 (or plain) payload so each chunk fits Telegram's size limit.
@@ -77,7 +144,7 @@ export function splitTelegramMessage(
   if (!Number.isFinite(limit) || limit < 1) {
     throw new RangeError(`splitTelegramMessage limit must be >= 1, got ${limit}`);
   }
-  if (text.length <= limit) return [text];
+  if (utf16Length(text) <= limit) return [text];
 
   const parts: string[] = [];
   let remaining = text;
@@ -94,7 +161,7 @@ export function splitTelegramMessage(
     return cut - ((cut - start) % 2);
   }
 
-  while (remaining.length > limit) {
+  while (utf16Length(remaining) > limit) {
     let cut = remaining.lastIndexOf("\n", limit);
     if (cut <= 0) cut = Math.floor(limit);
     cut = safeCut(cut);
@@ -109,7 +176,7 @@ export function splitTelegramMessage(
     if (remaining.startsWith("\n")) remaining = remaining.slice(1);
   }
 
-  if (remaining.length > 0) parts.push(remaining);
+  if (utf16Length(remaining) > 0) parts.push(remaining);
   return parts;
 }
 
@@ -201,7 +268,7 @@ export function safeErrorMessage(error: unknown, secrets: readonly string[] = []
 }
 
 function usdc(units: bigint): string {
-  return escapeMd(`${formatUsdc(units)} USDC`);
+  return escapeMd(isolateAmount(`${formatUsdc(units)} USDC`));
 }
 
 function who(address: string): string {
@@ -224,9 +291,19 @@ export function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
+  const tx = mdTxLink(config, event);
+  return tx ? `_${ledger}_ · ${tx}` : `_${ledger}_`;
+}
+
+/**
+ * MarkdownV2 `tx` link for an event: a link when the explorer URL passes the
+ * shared link policy, inert `tx` text when the event has a well-formed hash
+ * but its URL is unsafe, and null when there is no usable hash at all.
+ */
+function mdTxLink(config: StellarConfig, event: DecodedEvent): string | null {
   const url = eventExplorerUrl(config, event);
-  if (!url) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${url})`;
+  if (url) return `[tx](${escapeMdLinkUrl(url)})`;
+  return eventTxHash(event) !== null ? "tx" : null;
 }
 
 /**
@@ -241,18 +318,23 @@ export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): st
   // Link only well-formed 64-hex transaction hashes. An externally-derived
   // identifier that is empty, oversized or malformed gets no link: a broken
   // explorer link is worse than no link, and the hash itself is never altered here.
-  const raw = event.txHash ?? "";
-  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
-  const txHash = raw.trim();
-  if (!TX_HASH_RE.test(txHash)) return null;
+  const txHash = eventTxHash(event);
+  if (txHash === null) return null;
   try {
-    const url = txExplorerUrl(config, txHash);
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") return null;
-    return url;
+    // The shared link policy (https only, no userinfo, no control characters)
+    // decides; a hand-built config with an unsafe explorer origin gets no link.
+    return safeLinkUrl(txExplorerUrl(config, txHash));
   } catch {
     return null;
   }
+}
+
+/** The event's transaction hash when it is a well-formed 64-hex value, else null. */
+export function eventTxHash(event: DecodedEvent): string | null {
+  const raw = typeof event?.txHash === "string" ? event.txHash : "";
+  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
+  const txHash = raw.trim();
+  return TX_HASH_RE.test(txHash) ? txHash : null;
 }
 
 export interface ExplorerButton {
@@ -265,12 +347,77 @@ export interface ExplorerKeyboard {
 }
 
 /**
+ * Optional routing fields that let notification renderers resolve a per-route
+ * language preference when `routes` is configured.
+ */
+export interface RouteLocaleConfig {
+  locale?: string | null;
+  chatId?: string;
+  chatIds?: readonly string[];
+  marketChatId?: string;
+  squadChatId?: string;
+  routes?: readonly TelegramRoute[];
+  /** Explicit route-level locale override for callers formatting a single route directly. */
+  routeLocale?: string | null;
+}
+
+/**
+ * Resolve the effective notification locale for a route/event.
+ *
+ * Precedence:
+ * 1. Explicit `options.locale` / `options.route.locale` / `config.routeLocale` when supported.
+ * 2. Matching `config.routes` entry for the resolved destination `chatId` when supported.
+ * 3. Global `config.locale` when supported.
+ * 4. {@link DEFAULT_LOCALE} (`"en"`).
+ *
+ * Unsupported or empty locale values deterministically fall back to the next
+ * level rather than throwing.
+ */
+export function resolveNotificationLocale(
+  config: RouteLocaleConfig,
+  options?: {
+    chatId?: string;
+    source?: ContractSource;
+    route?: Pick<TelegramRoute, "locale"> | null;
+    locale?: string | null;
+  },
+): Locale {
+  const tryLocale = (value: string | null | undefined): Locale | null =>
+    typeof value === "string" && value.trim() !== "" ? normalizeLocale(value) : null;
+
+  const explicit =
+    tryLocale(options?.locale) ??
+    tryLocale(options?.route?.locale) ??
+    tryLocale(config.routeLocale);
+  if (explicit !== null) return explicit;
+
+  if (Array.isArray(config.routes) && config.routes.length > 0) {
+    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+    const targetChatId =
+      options?.chatId ??
+      (options?.source === "market"
+        ? config.marketChatId || defaultChat
+        : options?.source === "squad"
+          ? config.squadChatId || defaultChat
+          : defaultChat);
+    if (targetChatId) {
+      const matched = config.routes.find((route) => route.chatId === targetChatId);
+      const matchedLocale = tryLocale(matched?.locale);
+      if (matchedLocale !== null) return matchedLocale;
+    }
+  }
+
+  return tryLocale(config.locale) ?? DEFAULT_LOCALE;
+}
+
+/**
  * Config the keyboard builder reads: the chain fields `eventExplorerUrl`
  * needs, plus the optional Mimir web-app origin (`MIMIR_APP_URL`) that adds a
  * second button. Optional here so a chain-only config keeps building the
  * explorer-only keyboard it has always built.
  */
-export type KeyboardConfig = StellarConfig & { mimirAppUrl?: string | null };
+export type KeyboardConfig = StellarConfig &
+  RouteLocaleConfig & { mimirAppUrl?: string | null };
 
 /**
  * Telegram inline keyboard for an event notification.
@@ -287,7 +434,7 @@ export function explorerKeyboard(
   config: KeyboardConfig,
   event: DecodedEvent,
 ): ExplorerKeyboard | undefined {
-  const messages = messagesFor(config.locale);
+  const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
   const buttons: ExplorerButton[] = [];
   const explorerUrl = eventExplorerUrl(config, event);
   if (explorerUrl) buttons.push({ text: messages.explorerButtonText, url: explorerUrl });
@@ -311,7 +458,7 @@ export function formatLastEvent(
   const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
   return (
     `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
-    `This event has no notification summary\.\n${footer(config, event)}`
+    `This event has no notification summary\\.\n${footer(config, event)}`
   );
 }
 
@@ -322,10 +469,31 @@ export interface FormatDigestOptions {
    * Multi-event groups get an escaped Group_Key header and indented sub-lines;
    * singletons are rendered exactly like the flat layout.
    *
-   * Defaults to `false` — the existing flat layout is unchanged when this
-   * option is omitted or set to `false`.
+   * Defaults to `false` — the existing one-bullet-per-event flat layout is
+   * unchanged when this option is omitted or set to `false`.
+   *
+   * Both layouts order events via {@link sortDigestEvents}: chain close time,
+   * then canonical chain identity when timestamps are equal. This makes replay
+   * and live processing emit byte-identical digests for the same event set.
    */
   grouped?: boolean;
+  /**
+   * Completeness metadata for the digest period.
+   *
+   * When incomplete (e.g. affected by an RPC gap or restart), the header
+   * explicitly labels the period as incomplete and marks the event count as a
+   * partial observation rather than a complete ledger summary.
+   */
+  completeness?: Partial<DigestPeriodCompleteness>;
+}
+
+function digestHeader(count: number, completeness: DigestPeriodCompleteness): string {
+  if (completeness.complete) {
+    return `*Mimir Digest* — ${count} events in this cycle`;
+  }
+  const label = formatCompletenessLabel(completeness) ?? "Incomplete period";
+  const noun = count === 1 ? "event" : "events";
+  return `*Mimir Digest* — ${escapeMd(label)} \\(${count} observed ${noun}, partial\\)`;
 }
 
 /**
@@ -340,9 +508,12 @@ function flatLine(event: DecodedEvent): string {
 /**
  * Render a grouped digest.  Called only when `options.grouped` is `true`.
  */
-function renderGroupedDigest(events: readonly DecodedEvent[]): string {
+function renderGroupedDigest(
+  events: readonly DecodedEvent[],
+  completeness: DigestPeriodCompleteness,
+): string {
   const groups = groupDigestEvents(events);
-  const header = `*Mimir Digest* — ${events.length} events in this cycle`;
+  const header = digestHeader(events.length, completeness);
   const body: string[] = [];
 
   for (const group of groups) {
@@ -365,10 +536,16 @@ function renderGroupedDigest(events: readonly DecodedEvent[]): string {
 
 /**
  * One MarkdownV2 message summarising a burst of events: a header with the count
- * and one bounded line per event. Returns null when there is nothing to send.
+ * and one bounded line per event. Returns null when there is nothing to send
+ * and the digest period is complete.
  *
  * Pass `{ grouped: true }` to group consecutive events by claim / squad market.
+ * Pass `{ completeness: { complete: false, reasons: ["rpc_gap"] } }` (or
+ * `"restart"`) to label an incomplete period explicitly so partial counts are
+ * never presented as complete ledger summaries.
  * The default (`{}` or no second argument) produces the unchanged flat layout.
+ * Both layouts use deterministic chain-time + canonical-identity ordering, so
+ * equal timestamps never make replay output depend on arrival order.
  */
 export function formatDigest(
   events: readonly DecodedEvent[],
@@ -376,7 +553,7 @@ export function formatDigest(
 ): string | null {
   if (events.length === 0) return null;
   if (options.grouped) return renderGroupedDigest(events);
-  const lines = events.map(flatLine);
+  const lines = sortDigestEvents(events).map(flatLine);
   return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
 }
 
@@ -540,12 +717,13 @@ export function eventAllowedByCategory(
 }
 
 export function formatEvent(
-  config: StellarConfig & {
-    channelPreviewMode?: boolean;
-    notificationCategories?: readonly string[];
-    highlightThresholds?: HighlightThresholds;
-    nowMs?: number;
-  },
+  config: StellarConfig &
+    RouteLocaleConfig & {
+      channelPreviewMode?: boolean;
+      notificationCategories?: readonly string[];
+      highlightThresholds?: HighlightThresholds;
+      nowMs?: number;
+    },
   event: DecodedEvent,
   nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
@@ -557,7 +735,7 @@ export function formatEvent(
       : undefined;
   const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const messages = messagesFor(config.locale);
+    const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
     let head = headline(messages, event, currentMs);
     if (head === null) return null;
     const effectiveThresholds = thresholds ?? config.highlightThresholds;
@@ -582,6 +760,8 @@ export function formatEvent(
 const MAX_PLAIN_TEXT_LENGTH = 4000;
 
 function plainUsdc(units: bigint): string {
+  // Plaintext is not a Telegram renderer; the isolate belongs on the
+  // Markdown and HTML paths, where the client applies bidi layout.
   return `${formatUsdc(units)} USDC`;
 }
 
@@ -730,11 +910,11 @@ function plainHeadline(
 }
 
 /**
- * Clip a finished plain-text message without splitting a Unicode code point.
+ * Clip a finished plain-text message to Telegram's UTF-16 budget without
+ * splitting a surrogate pair. See {@link clipUtf16} for the unit contract.
  */
 function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
-  const characters = Array.from(text);
-  return characters.length <= max ? text : `${characters.slice(0, max - 1).join("")}…`;
+  return clipUtf16(text, max);
 }
 
 /**
@@ -747,11 +927,11 @@ function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
  * a minimal bounded line rather than crashing the notifier.
  */
 export function formatPlainTextEvent(
-  config: StellarConfig & { highlightThresholds?: HighlightThresholds; nowMs?: number },
+  config: StellarConfig & RouteLocaleConfig & { highlightThresholds?: HighlightThresholds; nowMs?: number },
   event: DecodedEvent,
   nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
-  const messages = messagesFor(config.locale);
+  const messages = messagesFor(resolveNotificationLocale(config, { source: event?.source }));
   const nowMs = typeof nowMsOrThresholds === "number" ? nowMsOrThresholds : undefined;
   const thresholds =
     typeof nowMsOrThresholds === "object" && nowMsOrThresholds !== null
@@ -792,7 +972,7 @@ function minimalPlainTextEvent(messages: Messages, event: DecodedEvent): string 
  * Fallback message when an event payload is malformed or an error occurs during formatting.
  */
 export function formatFallbackEvent(
-  config: StellarConfig,
+  config: StellarConfig & RouteLocaleConfig,
   event: DecodedEvent,
   reason = "malformed payload",
 ): string {
@@ -801,7 +981,7 @@ export function formatFallbackEvent(
   const ledger = escapeMd(String(event.ledger ?? "unknown"));
   const safeReason = escapeMd(safeErrorMessage(reason));
   const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
-  return messagesFor(config.locale).notificationMd.fallbackEvent(
+  return messagesFor(resolveNotificationLocale(config, { source: event?.source })).notificationMd.fallbackEvent(
     source,
     contract,
     ledger,

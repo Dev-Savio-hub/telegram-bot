@@ -1,4 +1,5 @@
-import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
+import { open, mkdir, readdir, unlink, chmod, readFile, writeFile, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent, ContractSource } from "./decode.js";
@@ -39,6 +40,7 @@ export interface EventArchiveOptions {
   dir: string;
   maxBytes?: number;
   maxFiles?: number;
+  schemaVersion?: number;
 }
 
 export interface EventArchive {
@@ -567,17 +569,40 @@ export function isArchivedEvent(value: unknown): value is ArchivableEvent {
 }
 
 export function createEventArchive(options: EventArchiveOptions): EventArchive {
-  const { dir } = options;
+  const { dir, metadata } = options;
   const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_MAX_BYTES);
   const maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
+  const writerVersion = negotiateArchiveSchemaVersion({
+    format: ARCHIVE_SCHEMA_FORMAT,
+    mode: "write",
+    requestedVersion: options.schemaVersion,
+  });
 
   let currentHandle: any = null;
   let currentFilePath: string | null = null;
   let currentSize = 0;
   let fileIndex = 0;
   let closed = false;
+  let schemaVerified = false;
 
   let queue: Promise<void> = Promise.resolve();
+
+  async function ensureWriterSchema(): Promise<void> {
+    if (schemaVerified) return;
+    const existing = await readArchiveSchema(dir);
+    if (existing.explicitVersionFound && existing.schemaVersion !== writerVersion) {
+      throw new UnsupportedArchiveSchemaError({
+        code: "UNSUPPORTED_SCHEMA_VERSION",
+        foundVersion: existing.schemaVersion,
+        supportedVersions: SUPPORTED_ARCHIVE_WRITER_VERSIONS,
+        message: `Archive directory schema v${existing.schemaVersion} conflicts with writer v${writerVersion}`,
+      });
+    }
+    if (!existing.explicitVersionFound) {
+      await writeArchiveSchema(dir, writerVersion);
+    }
+    schemaVerified = true;
+  }
 
   async function rotateIfNeeded(additionalBytes: number): Promise<void> {
     if (currentHandle && currentSize + additionalBytes <= maxBytes) {
@@ -622,12 +647,21 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
 
     const st = await currentHandle.stat();
     currentSize = st.size;
+
+    if (hasMetadata && currentSize === 0) {
+      const header = JSON.stringify({ type: "metadata", ...metadata }) + "\n";
+      const headerBuf = Buffer.from(header, "utf8");
+      await currentHandle.write(headerBuf);
+      await currentHandle.sync();
+      currentSize += headerBuf.byteLength;
+    }
   }
 
   async function doAppend(events: readonly ArchivableEvent[]): Promise<void> {
     if (closed) {
       throw new Error("Event archive is closed");
     }
+    await ensureWriterSchema();
     if (!events || events.length === 0) return;
 
     for (const event of events) {
@@ -663,8 +697,9 @@ export function createEventArchive(options: EventArchiveOptions): EventArchive {
       return queue;
     },
     async close(): Promise<void> {
-      queue = queue.then(() => doClose());
-      return queue;
+      const operation = queue.then(() => doClose());
+      queue = operation.catch(() => {});
+      return operation;
     },
   };
 }
@@ -693,7 +728,7 @@ export async function* readArchive<T extends ArchivableEvent = DecodedEvent>(
     const handle = await open(filePath, "r");
     try {
       const content = await handle.readFile({ encoding: "utf8" });
-      const lines = content.split("\n");
+      const lines = content.split(/\r?\n/);
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index]!;
         const trimmed = line.trim();
@@ -736,4 +771,49 @@ export async function* readArchive<T extends ArchivableEvent = DecodedEvent>(
   for (const event of stagedEvents) {
     yield event;
   }
+}
+
+export async function inspectArchiveSchema(
+  dir: string,
+  options: Pick<ReadArchiveOptions, "acceptedVersions"> = {},
+): Promise<InspectedArchiveSchema> {
+  return readArchiveSchema(dir, options.acceptedVersions);
+}
+
+function looksLikeArchivePath(input: ArchiveCoverageInput): input is string {
+  if (typeof input !== "string") return false;
+  const trimmed = input.trim();
+  return trimmed.length > 0 && !trimmed.startsWith("{") && !trimmed.startsWith("[");
+}
+
+async function readCoverageCapture(dir: string): Promise<DecodedEvent[]> {
+  const events: DecodedEvent[] = [];
+  for await (const event of readArchive(dir)) events.push(event);
+  return events;
+}
+
+export async function compareArchiveDirCoverage(
+  firstDir: string,
+  secondDir: string,
+  options: ArchiveCoverageOptions | LedgerRange = {},
+): Promise<ArchiveCoverageReport> {
+  const [first, second] = await Promise.all([
+    readCoverageCapture(firstDir),
+    readCoverageCapture(secondDir),
+  ]);
+  return compareLedgerCoverage(first, second, options);
+}
+
+export function compareArchiveCoverage(
+  first: ArchiveCoverageInput,
+  second: ArchiveCoverageInput,
+  options: ArchiveCoverageOptions | LedgerRange = {},
+): ArchiveCoverageReport | Promise<ArchiveCoverageReport> {
+  if (looksLikeArchivePath(first) || looksLikeArchivePath(second)) {
+    if (typeof first !== "string" || typeof second !== "string") {
+      throw new TypeError("Both archive paths must be strings");
+    }
+    return compareArchiveDirCoverage(first, second, options);
+  }
+  return compareLedgerCoverage(first, second, options);
 }
